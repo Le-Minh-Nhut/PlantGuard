@@ -8,3 +8,4 @@ requests
 tensorflow
 gunicorn
 pydantic
+protobuf==4.25.3

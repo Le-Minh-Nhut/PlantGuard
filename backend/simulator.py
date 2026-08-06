@@ -11,7 +11,8 @@ while True:
         "pH": round(random.uniform(6, 8), 2)
     }
     try:
-        requests.post("http://192.168.1.11:8000/api/data", json=payload)
+        # requests.post("http://192.168.1.11:8000/api/data", json=payload)
+        requests.post("http://backend:8000/api/data", json=payload)
         print("Gửi:", payload)
     except Exception as e:
         print("Lỗi gửi:", e)
