@@ -9,3 +9,10 @@ tensorflow
 gunicorn
 pydantic
 protobuf==4.25.3
+roboflow
+PyYAML
+Pillow
+ImageHash
+scikit-learn
+iterative-stratification
+ultralytics
