@@ -2,13 +2,88 @@
 #include <HTTPClient.h>
 #include "esp_camera.h"
 #include "board_config.h"
+#include <WebSocketsClient.h>
 
 const char* ssid = "Sai 3G di ma";
 const char* password = "50thicho";
 
 // const char* serverUrl =
 //   "http://192.168.1.28:8000/upload-image/";
-const char* serverUrl = "http://192.168.1.22/infer";
+const char* backendHost = "192.168.1.28";
+const uint16_t backendPort = 8000;
+const char* backendPath = "/ws/camera";
+const char* s3Url      = "http://192.168.1.22/frame";
+
+
+const unsigned long AI_INTERVAL_MS = 15000;
+unsigned long lastAiSent = 0;
+
+WebSocketsClient cameraWs;
+bool wsConnected = false;
+const unsigned long LIVE_INTERVAL_MS = 250;
+unsigned long lastLiveSent = 0;
+
+int postJpeg(const char* url, uint8_t* data, size_t len) {
+    WiFiClient client;
+    HTTPClient http;
+
+    client.setTimeout(5000);
+
+    http.setConnectTimeout(3000);
+    http.setTimeout(5000);
+    http.setReuse(false);
+
+    if (!http.begin(client, url)) {
+        Serial.printf("HTTP begin FAILED: %s\n", url);
+        return -100;
+    }
+
+    http.addHeader("Content-Type", "image/jpeg");
+    int code = http.POST(data, len);
+    if (code > 0) {
+        Serial.printf("POST %s -> HTTP %d\n", url, code);
+    } else {
+        Serial.printf(
+            "POST %s -> ERROR %d: %s\n",
+            url,
+            code,
+            HTTPClient::errorToString(code).c_str()
+        );
+    }
+    
+    http.end();
+    client.stop();
+    return code;
+}
+
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case WStype_CONNECTED:
+            wsConnected = true;
+            Serial.println("LIVE WS -> CONNECTED");
+            break;
+
+        case WStype_DISCONNECTED:
+            wsConnected = false;
+            Serial.println("LIVE WS -> DISCONNECTED");
+            break;
+
+        case WStype_ERROR:
+            wsConnected = false;
+            Serial.println("LIVE WS -> ERROR");
+            break;
+
+        case WStype_PING:
+            Serial.println("LIVE WS <- PING");
+            break;
+
+        case WStype_PONG:
+            break;
+
+        default:
+            break;
+    }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -84,10 +159,16 @@ void setup() {
   }
 
   Serial.println("Camera initialized!");
+  cameraWs.begin(backendHost, backendPort, backendPath);
+  cameraWs.onEvent(webSocketEvent);
+  cameraWs.setReconnectInterval(2000);
+  cameraWs.enableHeartbeat(15000, 3000, 2);
+
+  Serial.println("Camera WebSocket initialized");
   Serial.println("Testing ESP32-S3 TCP connection...");
 
   WiFiClient testClient;
-  if (testClient.connect("192.168.1.28", 9000)) {
+  if (testClient.connect("192.168.1.28", 8000)) {
       Serial.println("CAM -> LAPTOP TCP: SUCCESS");
       testClient.stop();
   } else {
@@ -117,60 +198,50 @@ void setup() {
 }
 
 void loop() {
-  Serial.println("Capturing image...");
+    cameraWs.loop();
 
-  camera_fb_t* fb = esp_camera_fb_get();
+    unsigned long now = millis();
 
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    delay(2000);
-    return;
-  }
-
-  Serial.printf(
-    "Captured %u bytes | Free heap: %u\n",
-    fb->len,
-    ESP.getFreeHeap()
-  );
-
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;
-    HTTPClient http;
-
-    client.setTimeout(20);
-
-    http.setConnectTimeout(5000);
-    http.setTimeout(20000);
-    http.setReuse(false);
-
-    Serial.print("Sending to: ");
-    Serial.println(serverUrl);
-
-    if (!http.begin(client, serverUrl)) {
-      Serial.println("HTTP begin failed");
-    } else {
-      http.addHeader("Content-Type", "image/jpeg");
-
-      int code = http.POST(fb->buf, fb->len);
-
-      if (code > 0) {
-        Serial.printf("HTTP POST code: %d\n", code);
-        Serial.println(http.getString());
-      } else {
-        Serial.printf(
-          "HTTP failed %d: %s\n",
-          code,
-          http.errorToString(code).c_str()
-        );
-      }
-
-      http.end();
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected");
+        delay(10);
+        return;
     }
-  } else {
-    Serial.println("WiFi disconnected");
-  }
 
-  esp_camera_fb_return(fb);
+    bool liveDue = wsConnected && (lastLiveSent == 0 || now - lastLiveSent >= LIVE_INTERVAL_MS);
+    bool aiDue = lastAiSent == 0 || now - lastAiSent >= AI_INTERVAL_MS;
+    if (!liveDue && !aiDue) {
+        delay(1);
+        return;
+    }
 
-  delay(10000);
+    camera_fb_t* fb = esp_camera_fb_get();
+
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        delay(10);
+        return;
+    }
+
+    if (liveDue) {
+        lastLiveSent = now;
+        bool sent = cameraWs.sendBIN(fb->buf,fb->len);
+
+        Serial.printf(
+            "LIVE | %u bytes | WS=%s | heap=%u\n",
+            fb->len,
+            sent ? "OK" : "FAIL",
+            ESP.getFreeHeap()
+        );
+    }
+
+    if (aiDue) {
+        lastAiSent = now;
+        int aiCode = postJpeg(s3Url,fb->buf, fb->len);
+        Serial.printf("AI FRAME -> S3 | HTTP=%d\n", aiCode);
+    }
+
+    esp_camera_fb_return(fb);
+
+    delay(1);
 }

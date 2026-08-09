@@ -9,6 +9,8 @@ idf_component_register(
         esp_http_server
         esp-dl
         yolo26
+        esp_http_client
+        json
 )
 
 set(MODEL_FILE
