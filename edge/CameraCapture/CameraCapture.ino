@@ -6,8 +6,9 @@
 const char* ssid = "Sai 3G di ma";
 const char* password = "50thicho";
 
-const char* serverUrl =
-  "http://192.168.1.28:8000/upload-image/";
+// const char* serverUrl =
+//   "http://192.168.1.28:8000/upload-image/";
+const char* serverUrl = "http://192.168.1.22/infer";
 
 void setup() {
   Serial.begin(115200);
@@ -65,7 +66,7 @@ void setup() {
   config.pixel_format = PIXFORMAT_JPEG;
 
   // Test ảnh nhỏ trước để tránh lỗi send payload
-  config.frame_size = FRAMESIZE_QVGA;
+  config.frame_size = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
@@ -83,6 +84,36 @@ void setup() {
   }
 
   Serial.println("Camera initialized!");
+  Serial.println("Testing ESP32-S3 TCP connection...");
+
+  WiFiClient testClient;
+  if (testClient.connect("192.168.1.28", 9000)) {
+      Serial.println("CAM -> LAPTOP TCP: SUCCESS");
+      testClient.stop();
+  } else {
+      Serial.println("CAM -> LAPTOP TCP: FAILED");
+  }
+
+  if (testClient.connect("192.168.1.22", 80)) {
+      Serial.println("TCP -> ESP32-S3: SUCCESS");
+      testClient.stop();
+  } else {
+      Serial.println("TCP -> ESP32-S3: FAILED");
+  }
+  Serial.print("Camera IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("Subnet: ");
+  Serial.println(WiFi.subnetMask());
+
+  Serial.print("Gateway: ");
+  Serial.println(WiFi.gatewayIP());
+
+  Serial.print("BSSID: ");
+  Serial.println(WiFi.BSSIDstr());
+
+  Serial.print("Channel: ");
+  Serial.println(WiFi.channel());
 }
 
 void loop() {
