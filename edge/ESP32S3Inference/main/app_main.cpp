@@ -26,12 +26,15 @@
 #include <cstdio>
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_http_client.h"
+#include "cJSON.h"
 
 static const char *TAG = "PlantGuard";
 
 extern const uint8_t model_binary_start[] asm(MODEL_SYMBOL_STR);
 static dl::Model *g_model = nullptr;
 static YOLO26 *g_yolo = nullptr;
+static const char *BACKEND_DETECTION_URL = "http://192.168.1.28:8000/api/detections";
 
 struct FramePacket {
     uint8_t *data;
@@ -42,20 +45,64 @@ struct FramePacket {
 
 static SemaphoreHandle_t g_frame_mutex = nullptr;
 static TaskHandle_t g_inference_task_handle = nullptr;
-
 static FramePacket *g_latest_frame = nullptr;
 static uint64_t g_frame_counter = 0;
-
 static SemaphoreHandle_t g_ai_mutex = nullptr;
-
-// static const char *WIFI_SSID_VALUE = WIFI_SSID;
-// static const char *WIFI_PASSWORD_VALUE = WIFI_PASSWORD;
-
-
 static EventGroupHandle_t wifi_event_group;
-
 #define WIFI_CONNECTED_BIT BIT0
 
+static esp_err_t post_json_to_backend(const char *json)
+{
+    if (json == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_http_client_config_t config = {};
+    config.url = BACKEND_DETECTION_URL;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = 3000;
+
+    esp_http_client_handle_t client =esp_http_client_init(&config);
+
+    if (client == nullptr) {
+        ESP_LOGE(
+            TAG,
+            "Cannot create backend HTTP client"
+        );
+
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, json, static_cast<int>(strlen(json)));
+    esp_err_t err = esp_http_client_perform(client);
+
+    int status_code = -1;
+
+    if (err == ESP_OK) {
+        status_code = esp_http_client_get_status_code(client);
+
+        ESP_LOGI(
+            TAG,
+            "Detection -> backend | HTTP=%d",
+            status_code
+        );
+    }
+    else {
+        ESP_LOGW(
+            TAG,
+            "Detection -> backend failed: %s",
+            esp_err_to_name(err)
+        );
+    }
+
+    esp_http_client_cleanup(client);
+    if (err == ESP_OK && status_code >= 200 && status_code < 300) {
+        return ESP_OK;
+    }
+
+    return ESP_FAIL;
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -144,18 +191,10 @@ static void inference_task(void *arg)
     while (true) {
 
         // Ngủ cho tới khi /frame báo có ảnh mới.
-        ulTaskNotifyTake(
-            pdTRUE,
-            portMAX_DELAY
-        );
-
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         FramePacket *frame = nullptr;
-
         // Lấy frame mới nhất ra.
-        xSemaphoreTake(
-            g_frame_mutex,
-            portMAX_DELAY
-        );
+        xSemaphoreTake(g_frame_mutex, portMAX_DELAY);
 
         frame = g_latest_frame;
         g_latest_frame = nullptr;
@@ -173,12 +212,11 @@ static void inference_task(void *arg)
             static_cast<unsigned>(frame->len)
         );
         xSemaphoreTake(g_ai_mutex, portMAX_DELAY);
+        int64_t decode_start = esp_timer_get_time();
         // JPEG -> RGB
-        auto img =
-            g_yolo->decode_jpeg(
-                frame->data,
-                frame->len
-            );
+        auto img =g_yolo->decode_jpeg(frame->data, frame->len);
+        int64_t decode_end = esp_timer_get_time();
+
 
         // JPEG compressed không cần nữa.
         heap_caps_free(frame->data);
@@ -192,35 +230,42 @@ static void inference_task(void *arg)
         }
 
         // AI
-        int64_t start = esp_timer_get_time();
-
+        int64_t preprocess_start = esp_timer_get_time();
         g_yolo->preprocess(img);
+        int64_t preprocess_end = esp_timer_get_time();
         heap_caps_free(img.data);
         img.data = nullptr;
+        int64_t inference_start = esp_timer_get_time();
         g_model->run();
-        auto detections =
-            g_yolo->postprocess(
-                g_model->get_outputs()
-            );
+        int64_t inference_end = esp_timer_get_time();
+        int64_t postprocess_start = esp_timer_get_time();
+        auto detections = g_yolo->postprocess(g_model->get_outputs());
+        int64_t postprocess_end = esp_timer_get_time();
         xSemaphoreGive(g_ai_mutex);
 
-        float inference_ms =
-            (esp_timer_get_time() - start) / 1000.0f;
+        float decode_ms = (decode_end - decode_start) / 1000.0f;
+        float preprocess_ms = (preprocess_end - preprocess_start) / 1000.0f;
+        float inference_ms = (inference_end - inference_start) / 1000.0f;
+        float postprocess_ms = (postprocess_end - postprocess_start)/ 1000.0f;
+        float total_ms = decode_ms + preprocess_ms + inference_ms + postprocess_ms;
+
+
+
 
         ESP_LOGI(
             TAG,
-            "Frame #%llu | AI %.2f ms | detections=%u",
+            "Frame #%llu | total=%.2f ms | inference=%.2f ms | detections=%u",
             frame->frame_id,
+            total_ms,
             inference_ms,
             static_cast<unsigned>(detections.size())
         );
 
+        size_t valid_detection_count = 0;
+
         for (const auto &res : detections) {
-            if (
-                res.category >= 0 &&
-                res.category < PLANTGUARD_NUM_CLASSES &&
-                res.box.size() >= 4
-            ) {
+            if (res.category >= 0 && res.category < PLANTGUARD_NUM_CLASSES && res.box.size() >= 4) {
+                valid_detection_count++;
                 ESP_LOGI(
                     TAG,
                     "[%s] score=%.3f bbox=[%d,%d,%d,%d]",
@@ -233,7 +278,64 @@ static void inference_task(void *arg)
                 );
             }
         }
+        cJSON *root = cJSON_CreateObject();
+        if (root == nullptr) {
+            ESP_LOGE(TAG, "Cannot create detection JSON");
+            free_frame(frame);
+            continue;
+        }
+        cJSON_AddStringToObject(root, "device_id", "esp32-s3");
+        cJSON_AddNumberToObject(root,"frame_id", static_cast<double>(frame->frame_id));
+        cJSON_AddNumberToObject(root,"timestamp_us", static_cast<double>(frame->timestamp_us));
+        cJSON_AddNumberToObject(root, "detection_count", static_cast<double>(valid_detection_count));
+        cJSON *detection_array = cJSON_AddArrayToObject(root, "detections");
 
+        if (detection_array != nullptr) {
+            for (const auto &res : detections) {
+
+                if (res.category < 0 || res.category >= PLANTGUARD_NUM_CLASSES || res.box.size() < 4) {
+                    continue;
+                }
+                cJSON *item = cJSON_CreateObject();
+                if (item == nullptr) {
+                    continue;
+                }
+
+                cJSON_AddNumberToObject(item, "class_id", res.category);
+                cJSON_AddStringToObject(item, "class", plantguard_classes[res.category]);
+                cJSON_AddNumberToObject(item, "confidence", res.score);
+                cJSON *bbox = cJSON_AddArrayToObject( item, "bbox");
+
+                if (bbox != nullptr) {
+                    cJSON_AddItemToArray(bbox, cJSON_CreateNumber(res.box[0]));
+                    cJSON_AddItemToArray(bbox, cJSON_CreateNumber(res.box[1]));
+                    cJSON_AddItemToArray(bbox, cJSON_CreateNumber(res.box[2]));
+                    cJSON_AddItemToArray(bbox, cJSON_CreateNumber(res.box[3]));
+                }
+
+
+                cJSON_AddItemToArray(detection_array, item);
+            }
+        }
+        cJSON *latency = cJSON_AddObjectToObject(root,"latency");
+        if (latency != nullptr) {
+            cJSON_AddNumberToObject(latency, "decode_ms", decode_ms);
+            cJSON_AddNumberToObject(latency, "preprocess_ms", preprocess_ms);
+            cJSON_AddNumberToObject(latency, "inference_ms", inference_ms);
+            cJSON_AddNumberToObject(latency, "postprocess_ms", postprocess_ms);
+            cJSON_AddNumberToObject(latency, "total_ms", total_ms);
+        }
+
+        char *json = cJSON_PrintUnformatted(root);
+        if (json != nullptr) {
+            ESP_LOGI(TAG, "Sending detection result for frame #%llu", frame->frame_id);
+            post_json_to_backend(json);
+            cJSON_free(json);
+        }
+        else {
+            ESP_LOGE(TAG,"Cannot serialize detection JSON");
+        }
+        cJSON_Delete(root);
         free_frame(frame);
     }
 }
