@@ -58,6 +58,7 @@ backend/runtime/
 
 # ESP-IDF build
 edge/ESP32S3Inference/build/
+edge/ESP32S3Inference/managed_components/
 edge/ESP32S3Inference/sdkconfig
 edge/ESP32S3Inference/sdkconfig.old
 # ESP-DL models
