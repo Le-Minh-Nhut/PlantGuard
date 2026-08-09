@@ -51,8 +51,17 @@ coverage.xml
 .pytest_cache/
 cover/
 
-.data/image
+data/
 backend/runtime/
+# ESP32 secrets
+**/secrets.h
+
+# ESP-IDF build
+edge/ESP32S3Inference/build/
+edge/ESP32S3Inference/sdkconfig
+edge/ESP32S3Inference/sdkconfig.old
+# ESP-DL models
+*.espdl
 
 # Translations
 *.mo
