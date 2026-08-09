@@ -24,12 +24,29 @@
 #include "plantguard_classes.hpp"
 #include "esp_timer.h"
 #include <cstdio>
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "PlantGuard";
 
 extern const uint8_t model_binary_start[] asm(MODEL_SYMBOL_STR);
 static dl::Model *g_model = nullptr;
 static YOLO26 *g_yolo = nullptr;
+
+struct FramePacket {
+    uint8_t *data;
+    size_t len;
+    uint64_t frame_id;
+    int64_t timestamp_us;
+};
+
+static SemaphoreHandle_t g_frame_mutex = nullptr;
+static TaskHandle_t g_inference_task_handle = nullptr;
+
+static FramePacket *g_latest_frame = nullptr;
+static uint64_t g_frame_counter = 0;
+
+static SemaphoreHandle_t g_ai_mutex = nullptr;
 
 // static const char *WIFI_SSID_VALUE = WIFI_SSID;
 // static const char *WIFI_PASSWORD_VALUE = WIFI_PASSWORD;
@@ -107,6 +124,118 @@ static void init_wifi()
     );
 
     ESP_LOGI(TAG, "Wi-Fi connected");
+}
+
+static void free_frame(FramePacket *frame)
+{
+    if (frame == nullptr) {
+        return;
+    }
+
+    if (frame->data != nullptr) {
+        heap_caps_free(frame->data);
+    }
+
+    delete frame;
+}
+
+static void inference_task(void *arg)
+{
+    while (true) {
+
+        // Ngủ cho tới khi /frame báo có ảnh mới.
+        ulTaskNotifyTake(
+            pdTRUE,
+            portMAX_DELAY
+        );
+
+        FramePacket *frame = nullptr;
+
+        // Lấy frame mới nhất ra.
+        xSemaphoreTake(
+            g_frame_mutex,
+            portMAX_DELAY
+        );
+
+        frame = g_latest_frame;
+        g_latest_frame = nullptr;
+
+        xSemaphoreGive(g_frame_mutex);
+
+        if (frame == nullptr) {
+            continue;
+        }
+
+        ESP_LOGI(
+            TAG,
+            "AI processing frame #%llu (%u bytes)",
+            frame->frame_id,
+            static_cast<unsigned>(frame->len)
+        );
+        xSemaphoreTake(g_ai_mutex, portMAX_DELAY);
+        // JPEG -> RGB
+        auto img =
+            g_yolo->decode_jpeg(
+                frame->data,
+                frame->len
+            );
+
+        // JPEG compressed không cần nữa.
+        heap_caps_free(frame->data);
+        frame->data = nullptr;
+
+        if (img.data == nullptr) {
+            ESP_LOGE(TAG, "JPEG decode failed");
+            xSemaphoreGive(g_ai_mutex);
+            free_frame(frame);
+            continue;
+        }
+
+        // AI
+        int64_t start = esp_timer_get_time();
+
+        g_yolo->preprocess(img);
+        heap_caps_free(img.data);
+        img.data = nullptr;
+        g_model->run();
+        auto detections =
+            g_yolo->postprocess(
+                g_model->get_outputs()
+            );
+        xSemaphoreGive(g_ai_mutex);
+
+        float inference_ms =
+            (esp_timer_get_time() - start) / 1000.0f;
+
+        ESP_LOGI(
+            TAG,
+            "Frame #%llu | AI %.2f ms | detections=%u",
+            frame->frame_id,
+            inference_ms,
+            static_cast<unsigned>(detections.size())
+        );
+
+        for (const auto &res : detections) {
+            if (
+                res.category >= 0 &&
+                res.category < PLANTGUARD_NUM_CLASSES &&
+                res.box.size() >= 4
+            ) {
+                ESP_LOGI(
+                    TAG,
+                    "[%s] score=%.3f bbox=[%d,%d,%d,%d]",
+                    plantguard_classes[res.category],
+                    res.score,
+                    res.box[0],
+                    res.box[1],
+                    res.box[2],
+                    res.box[3]
+                );
+            }
+        }
+
+        free_frame(frame);
+    }
 }
 
 
@@ -200,7 +329,6 @@ static esp_err_t infer_handler(httpd_req_t *request)
     // return ESP_OK;
     if (!valid_jpeg) {
         heap_caps_free(jpeg_buffer);
-
         httpd_resp_set_type(request, "application/json");
         httpd_resp_sendstr(
             request,
@@ -210,38 +338,30 @@ static esp_err_t infer_handler(httpd_req_t *request)
         return ESP_OK;
     }
 
-
-    // ---------------------------------------------------------
+    xSemaphoreTake(g_ai_mutex, portMAX_DELAY);
     // 1. JPEG -> RGB888
-    // ---------------------------------------------------------
 
     ESP_LOGI(TAG, "Decoding JPEG...");
-
     int64_t decode_start = esp_timer_get_time();
-
-    dl::image::img_t img =
-        g_yolo->decode_jpeg(jpeg_buffer, image_size);
-
+    dl::image::img_t img = g_yolo->decode_jpeg(jpeg_buffer, image_size);
     int64_t decode_end = esp_timer_get_time();
 
 
-    // JPEG compressed buffer không cần nữa sau khi decode.
     heap_caps_free(jpeg_buffer);
     jpeg_buffer = nullptr;
 
 
     if (img.data == nullptr) {
         ESP_LOGE(TAG, "JPEG decode failed");
+        xSemaphoreGive(g_ai_mutex);
 
         httpd_resp_set_type(request, "application/json");
         httpd_resp_sendstr(
             request,
             "{\"status\":\"error\",\"message\":\"jpeg decode failed\"}"
         );
-
         return ESP_FAIL;
     }
-
 
     // 2. RGB888 -> letterbox -> INT8 model input
     ESP_LOGI(TAG, "Preprocessing image...");
@@ -275,14 +395,13 @@ static esp_err_t infer_handler(httpd_req_t *request)
 
     int64_t postprocess_end = esp_timer_get_time();
 
+    xSemaphoreGive(g_ai_mutex);
+
 
     // 5. Latency
     float decode_ms =(decode_end - decode_start) / 1000.0f;
-
     float preprocess_ms = (preprocess_end - preprocess_start) / 1000.0f;
-
     float inference_ms = (inference_end - inference_start) / 1000.0f;
-
     float postprocess_ms = (postprocess_end - postprocess_start) / 1000.0f;
 
 
@@ -441,6 +560,98 @@ static esp_err_t infer_handler(httpd_req_t *request)
     return ESP_OK;
 }
 
+static esp_err_t frame_handler(httpd_req_t *request)
+{
+    size_t image_size = request->content_len;
+
+    if (image_size == 0 || image_size > 512 * 1024) {
+        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid image size");
+        return ESP_FAIL;
+    }
+
+    auto *packet = new FramePacket{};
+
+    packet->data =
+        static_cast<uint8_t *>(
+            heap_caps_malloc(
+                image_size,
+                MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+            )
+        );
+
+    if (packet->data == nullptr) {
+        delete packet;
+
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot allocate frame");
+
+        return ESP_FAIL;
+    }
+
+    packet->len = image_size;
+    packet->timestamp_us = esp_timer_get_time();
+
+    size_t received = 0;
+
+    while (received < image_size) {
+
+        int result = httpd_req_recv(
+            request,
+            reinterpret_cast<char *>(packet->data + received),
+            image_size - received
+        );
+
+        if (result <= 0) {
+            free_frame(packet);
+            return ESP_FAIL;
+        }
+
+        received += result;
+    }
+
+    bool valid =
+        image_size >= 4 &&
+        packet->data[0] == 0xFF &&
+        packet->data[1] == 0xD8 &&
+        packet->data[image_size - 2] == 0xFF &&
+        packet->data[image_size - 1] == 0xD9;
+
+    if (!valid) {
+        free_frame(packet);
+
+        httpd_resp_send_err(
+            request,
+            HTTPD_400_BAD_REQUEST,
+            "Invalid JPEG"
+        );
+
+        return ESP_FAIL;
+    }
+
+    xSemaphoreTake(g_frame_mutex, portMAX_DELAY);
+    packet->frame_id = ++g_frame_counter;
+    const uint64_t accepted_frame_id = packet->frame_id;
+    FramePacket *old_frame = g_latest_frame;
+    g_latest_frame = packet;
+    xSemaphoreGive(g_frame_mutex);
+
+    if (old_frame != nullptr) {
+        ESP_LOGI(
+            TAG,
+            "Dropping stale frame #%llu",
+            old_frame->frame_id
+        );
+
+        free_frame(old_frame);
+    }
+    xTaskNotifyGive(g_inference_task_handle);
+    ESP_LOGI(TAG, "Accepted frame #%llu", accepted_frame_id);
+    httpd_resp_set_status(request, "202 Accepted");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_sendstr(request, "{\"status\":\"accepted\"}");
+
+    return ESP_OK;
+}
 
 
 static void start_http_server()
@@ -461,6 +672,13 @@ static void start_http_server()
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &infer_uri));
 
+    httpd_uri_t frame_uri = {};
+    frame_uri.uri = "/frame";
+    frame_uri.method = HTTP_POST;
+    frame_uri.handler = frame_handler;
+
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &frame_uri));
+
 
     ESP_LOGI(TAG, "HTTP server started");
     ESP_LOGI(TAG, "POST JPEG to /infer");
@@ -471,14 +689,17 @@ static void start_http_server()
 extern "C" void app_main()
 {
     esp_err_t result = nvs_flash_init();
-
     if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
-
         ESP_ERROR_CHECK(nvs_flash_init());
     }
-
     ESP_LOGI(TAG, "Loading PlantGuard model...");
+
+    g_ai_mutex = xSemaphoreCreateMutex();
+    if (g_ai_mutex == nullptr) {
+        ESP_LOGE(TAG, "Cannot create AI mutex");
+        return;
+    }
 
     g_model = new dl::Model(
         reinterpret_cast<const char *>(model_binary_start),
@@ -490,12 +711,23 @@ extern "C" void app_main()
     );
 
     ESP_LOGI(TAG, "PlantGuard model loaded");
-
     ESP_LOGI(TAG, "Initializing YOLO26 processor...");
-
     g_yolo = new YOLO26(g_model, YOLO_TARGET_K, YOLO_CONF_THRESH, plantguard_classes);
-
     ESP_LOGI(TAG, "YOLO26 processor initialized");
+
+    g_frame_mutex = xSemaphoreCreateMutex();
+
+    if (g_frame_mutex == nullptr) {
+        ESP_LOGE(TAG, "Cannot create frame mutex");
+        return;
+    }
+
+    BaseType_t task_result = xTaskCreate(inference_task, "InferenceTask", 12 * 1024, nullptr, 5, &g_inference_task_handle);
+
+    if (task_result != pdPASS) {
+        ESP_LOGE(TAG, "Cannot create InferenceTask");
+        return;
+    }
 
     init_wifi();
     start_http_server();
