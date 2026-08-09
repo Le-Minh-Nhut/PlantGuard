@@ -1,4 +1,4 @@
-import React, { type JSX, useState, useEffect } from "react";
+import React, { type JSX, useState, useEffect, useRef } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { WiDaySunny } from "react-icons/wi";
@@ -42,6 +42,8 @@ export default function Dashboard(): JSX.Element {
   const [aiResult, setAiResult] = useState<AiAnalysisResult | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [liveFrameUrl, setLiveFrameUrl] =useState<string | null>(null);
+  const liveFrameUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     const socket = new WebSocket("ws://localhost:8000/ws");
@@ -51,6 +53,46 @@ export default function Dashboard(): JSX.Element {
     };
     return () => {
       socket.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    const socket = new WebSocket("ws://192.168.1.28:8000/ws/camera/live");
+    socket.onopen = () => {
+      console.log("CAMERA VIEWER WS CONNECTED");
+    };
+
+    socket.onerror = (error) => {
+      console.error("CAMERA VIEWER WS ERROR", error);
+    };
+
+    socket.onclose = () => {
+      console.log("CAMERA VIEWER WS CLOSED");
+    };
+    socket.onmessage = (event) => {
+      const blob = event.data as Blob;
+
+      console.log(
+        "CAMERA FRAME RECEIVED",
+        blob.size,
+        "bytes"
+      );
+
+      const newUrl = URL.createObjectURL(blob);
+
+      if (liveFrameUrlRef.current) {
+        URL.revokeObjectURL(liveFrameUrlRef.current);
+      }
+
+      liveFrameUrlRef.current = newUrl;
+      setLiveFrameUrl(newUrl);
+    };
+
+    return () => {
+      socket.close();
+      if (liveFrameUrlRef.current) {
+        URL.revokeObjectURL(liveFrameUrlRef.current);
+      }
     };
   }, []);
 
@@ -109,6 +151,27 @@ export default function Dashboard(): JSX.Element {
           <InfoBox icon={<MdThermostat />} label="Temp" value={sensorData ? `${sensorData.temperature.toFixed(1)}°C` : "N/A"} />
           <InfoBox icon={<MdOpacity />} label="Humidity" value={sensorData ? `${sensorData.humidity.toFixed(1)}%` : "N/A"} />
           <InfoBox icon={<MdWaterDrop />} label="Soil Moisture" value={sensorData ? `${sensorData.soilMoisture.toFixed(0)}%` : "N/A"} />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Camera Trực Tiếp</CardTitle>
+        </CardHeader>
+
+        <CardContent className="p-4">
+          <div className="w-full max-w-2xl mx-auto aspect-[4/3] bg-black rounded-lg overflow-hidden">
+            {liveFrameUrl ? (
+              <img
+                src={liveFrameUrl}
+                alt="PlantGuard Live Camera"
+                className="w-full h-full object-contain"
+              />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center text-gray-400">
+                Đang chờ ESP32-CAM...
+              </div>
+            )}
+          </div>
         </CardContent>
       </Card>
 
